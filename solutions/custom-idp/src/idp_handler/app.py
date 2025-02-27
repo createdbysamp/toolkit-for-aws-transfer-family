@@ -60,69 +60,84 @@ def ip_in_cidr_list(ip_address, cidr_list):
 def lambda_handler(event, context):
     response_data = {}
 
-    logger.info({i: event[i] for i in event if i not in ["password"]})
 
-    if "username" not in event or "serverId" not in event:
-        raise IdpHandlerException("Incoming username or serverId missing  - Unexpected")
+    logger.info({key: event[key] for key in event if key not in ["password"]})
 
-    input_username = event["username"].lower()
-    logger.info(f"Username: {input_username}, ServerId: {event['serverId']}")
-    tracer.put_annotation(key="transfer_user", value=input_username)
+    try:
 
+        if "username" not in event or "serverId" not in event:
+            raise IdpHandlerException("Incoming username or serverId missing - Unexpected")
 
-    # Parse the username to get user and identity provider (if specified)
-    parsed_username = input_username.split(USER_NAME_DELIMITER)
+        input_username = event["username"].lower()
+        logger.info(f"Username: {input_username}, ServerId: {event['serverId']}")
+        tracer.put_annotation(key="transfer_user", value=input_username)
 
-    if 1 < len(parsed_username):
-        if (
-            USER_NAME_DELIMITER == "@" or USER_NAME_DELIMITER == "@@"
-        ):  # support format <user>@<idp>   OR <user>@@<idp>
-            username = USER_NAME_DELIMITER.join(parsed_username[:-1])
-            identity_provider = parsed_username[-1]
-        else:  # anything else is in this order <idp>\<user> , <idp>/<user>
-            username = USER_NAME_DELIMITER.join(parsed_username[1:])
-            identity_provider = parsed_username[0]
-    else:
-        username = parsed_username[0]
-        identity_provider = None
-
-    logger.info(
-        f"Parsed username and IdP: Username: {username} IDP: {identity_provider}"
-    )
-    if username == "$" or username == "$default$":
-        raise IdpHandlerException(f"Username $default$ is reserved and cannot be used.")
     
-    # Lookup user
-    if identity_provider:
-        user_record = USERS_TABLE.get_item(
-            Key={"user": username, "identity_provider_key": identity_provider}
-        ).get("Item", None)
-    else:
-        user_record = USERS_TABLE.query(
-            KeyConditionExpression=Key("user").eq(username)
-        ).get("Items", None)
-        logger.debug(f"user_record query result: {user_record}")
-        if 0 < len(user_record):
-            user_record = user_record[0]
+        parsed_username = input_username.split(USER_NAME_DELIMITER)
+
+        if len(parsed_username) > 1:
+            if USER_NAME_DELIMITER in ["@", "@@"]:  # Format: <user>@<idp> OR <user>@@<idp>
+                username = USER_NAME_DELIMITER.join(parsed_username[:-1])
+                identity_provider = parsed_username[-1]
+            else:  # Format: <idp>\<user> OR <idp>/<user>
+                username = USER_NAME_DELIMITER.join(parsed_username[1:])
+                identity_provider = parsed_username[0]
         else:
-            user_record = None
+            username = parsed_username[0]
+            identity_provider = None
 
-    if not user_record:
-        logger.info(
-            f"Record for user {username} identity provider {identity_provider} not found, retrieving default user record"
-        )
-        user_record = USERS_TABLE.query(
-            KeyConditionExpression=Key("user").eq("$default$")
-        ).get("Items", None)
-        logger.debug(f"user_record query result: {user_record}")
-        if 0 < len(user_record):
-            user_record = user_record[0]
+        logger.info(f"Parsed username and IdP: Username: {username}, IDP: {identity_provider}")
+
+        if username in ["$", "$default$"]:
+            raise IdpHandlerException("Username '$default$' is reserved and cannot be used.")
+
+        # Lookup user in DynamoDB
+        if identity_provider:
+            user_record = USERS_TABLE.get_item(
+                Key={"user": username, "identity_provider_key": identity_provider}
+            ).get("Item", None)
         else:
-            raise IdpHandlerException(f"no matching user records found")
+            user_records = USERS_TABLE.query(
+                KeyConditionExpression=Key("user").eq(username)
+            ).get("Items", [])
 
-    logger.info(f"user_record: {user_record}")
+            logger.debug(f"user_record query result: {user_records}")
+            user_record = user_records[0] if user_records else None
 
-    source_ip = event["sourceIp"]
+        # If user not found, attempt to get the default record
+        if not user_record:
+            logger.warning(
+                f"Record for user '{username}' with identity provider '{identity_provider}' not found. Trying default record."
+            )
+
+            default_records = USERS_TABLE.query(
+                KeyConditionExpression=Key("user").eq("$default$")
+            ).get("Items", [])
+
+            logger.debug(f"default user_record query result: {default_records}")
+            user_record = default_records[0] if default_records else None
+
+        if not user_record:
+            raise IdpHandlerException(f"No matching user records found for '{username}'")
+
+        logger.info(f"Authenticated user record: {user_record}")
+
+        source_ip = event["sourceIp"]
+        response_data["user_record"] = user_record
+        response_data["source_ip"] = source_ip
+
+        return {
+            "statusCode": 200,
+            "body": response_data
+        }
+
+    except IdpHandlerException as e:
+        logger.warning(f"Authentication failed: {str(e)}")
+        return {"statusCode": 401, "error": "Unauthorized"}
+
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "error": "Internal server error"}
 
     # Check IP allow list for user
     user_ipv4_allow_list = user_record.get("ipv4_allow_list", "")
